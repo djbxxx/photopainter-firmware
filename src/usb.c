@@ -99,6 +99,36 @@ bool usb_drive_enabled(void) { return drive_on; }
 bool usb_drive_ejected(void) { return drive_ejected; }
 bool usb_drive_busy_recent(void) { return board_millis() - last_io_ms < 1000; }
 
+// --- tracing (filled in callbacks, printed from the main loop)
+static volatile uint32_t n_tur, n_rd, n_wr, n_other;
+static volatile uint8_t ev_buf[32][3];
+static volatile uint8_t ev_head, ev_tail;
+static void trace(uint8_t op, uint8_t a, uint8_t b) {
+    uint8_t h = ev_head;
+    ev_buf[h & 31][0] = op; ev_buf[h & 31][1] = a; ev_buf[h & 31][2] = b;
+    ev_head = h + 1;
+}
+void usb_trace_dump(void) {
+    static uint32_t last_ms, l_tur, l_rd, l_wr;
+    while (ev_tail != ev_head) {
+        uint8_t t = ev_tail;
+        printf("msc: op %02x %d %d\n", ev_buf[t & 31][0], ev_buf[t & 31][1], ev_buf[t & 31][2]);
+        ev_tail = t + 1;
+    }
+    uint32_t now = board_millis();
+    if (now - last_ms > 5000 && (n_tur != l_tur || n_rd != l_rd || n_wr != l_wr)) {
+        printf("msc: tur %lu rd %lu wr %lu other %lu drive %d\n", (unsigned long)n_tur, (unsigned long)n_rd,
+               (unsigned long)n_wr, (unsigned long)n_other, drive_on);
+        l_tur = n_tur; l_rd = n_rd; l_wr = n_wr; last_ms = now;
+    }
+}
+
+bool tud_msc_prevent_allow_medium_removal_cb(uint8_t lun, uint8_t prohibit_removal, uint8_t control) {
+    (void)lun; (void)control;
+    trace(0x1E, prohibit_removal, 0);
+    return true;
+}
+
 // ---------------------------------------------------------------- MSC callbacks
 // No printf in here: printf services USB itself and would re-enter tud_task().
 
@@ -110,6 +140,7 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 }
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun) {
+    n_tur++;
     if (!drive_on) {
         tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);   // medium not present
         return false;
@@ -125,7 +156,8 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_siz
 }
 
 bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject) {
-    (void)lun; (void)power_condition;
+    (void)lun;
+    trace(0x1B, start | (load_eject << 1), power_condition);
     if (load_eject && !start) { drive_on = false; drive_ejected = true; }
     return true;
 }
@@ -134,6 +166,7 @@ bool tud_msc_is_writable_cb(uint8_t lun) { (void)lun; return true; }
 
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
     (void)lun;
+    n_rd++;
     if (!drive_on || (offset % 512) || (bufsize % 512)) return -1;
     last_io_ms = board_millis();
     if (sd_read_blocks(sd_get_by_num(0), buffer, lba + offset / 512, bufsize / 512) != 0) return -1;
@@ -142,6 +175,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void *buff
 
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
     (void)lun;
+    n_wr++;
     if (!drive_on || (offset % 512) || (bufsize % 512)) return -1;
     last_io_ms = board_millis();
     if (sd_write_blocks(sd_get_by_num(0), buffer, lba + offset / 512, bufsize / 512) != 0) return -1;
@@ -150,6 +184,8 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *
 
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void *buffer, uint16_t bufsize) {
     (void)buffer; (void)bufsize;
+    n_other++;
+    trace(scsi_cmd[0], scsi_cmd[1], scsi_cmd[4]);
     switch (scsi_cmd[0]) {
         case 0x1E:   // PREVENT ALLOW MEDIUM REMOVAL
         case 0x35:   // SYNCHRONIZE CACHE (writes are already synchronous)

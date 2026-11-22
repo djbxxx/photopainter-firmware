@@ -14,3 +14,4 @@ void usb_drive_disable(void);
 bool usb_drive_enabled(void);
 bool usb_drive_ejected(void);    // computer ejected the drive since it was enabled
 bool usb_drive_busy_recent(void);// a read/write happened in the last second
+void usb_trace_dump(void);       // print MSC commands seen (debug)

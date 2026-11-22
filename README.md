@@ -14,4 +14,9 @@ Build: `./build.sh` -> `build/photopainter.uf2`
 Flash (no buttons needed while this or the factory firmware runs): `picotool load -f -x build/photopainter.uf2`
 Restore factory firmware: `picotool load -f -x ../backup/factory_program.uf2`
 
-Host tests for the converter and screens: see `test/host/`.
+Host tests for the converter and screens: see `test/host/` (device output is byte-identical).
+
+Serial control (no buttons needed): `tools/ppctl.py log|next|drive|status` (needs pyserial).
+
+Measured on the frame (200 MHz): 12 MP JPEG ~10 s, 800x480 BMP ~3.6 s, panel refresh ~30 s.
+Not supported on the frame: PNG, HEIC, progressive JPEG (listed in photopainter-errors.txt).

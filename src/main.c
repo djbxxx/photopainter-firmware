@@ -9,6 +9,8 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
+#include "hardware/vreg.h"
+#include "hardware/clocks.h"
 #include "tusb.h"
 #include "board.h"
 #include "config.h"
@@ -18,7 +20,7 @@
 #include "ui.h"
 #include "usb.h"
 
-#define FW_VERSION "1.0"
+#define FW_VERSION "1.1"
 
 enum { SCR_PICTURE = 0, SCR_NOCARD, SCR_EMPTY, SCR_LOWBAT };
 
@@ -164,6 +166,8 @@ static int key_poll(button_t *k) {
     return ev;
 }
 
+static bool in_drive;   // drive mode as seen by the main loop (the USB side may switch off on eject)
+
 static void drive_on(bool reconnect) {
     if (reconnect) {   // make the computer notice the drive again
         tud_disconnect();
@@ -171,6 +175,7 @@ static void drive_on(bool reconnect) {
         tud_connect();
     }
     usb_drive_enable();
+    in_drive = true;
     printf("drive mode on\n");
 }
 
@@ -183,7 +188,7 @@ static void usb_loop(void) {
     uint32_t t0 = board_millis();
     while (!usb_host_connected() && board_millis() - t0 < 4000) { keepalive(); sleep_ms(5); }
     bool host = usb_host_connected();
-    if (!host) { usb_drive_disable(); printf("no computer, charging only\n"); }
+    if (!host) { usb_drive_disable(); in_drive = false; printf("no computer, charging only\n"); }
     uint32_t host_lost_since = 0;
 
     for (;;) {
@@ -192,9 +197,20 @@ static void usb_loop(void) {
         uint32_t now = board_millis();
         int ev = key_poll(&key);
         board_led_pwr(board_charging());
+        usb_trace_dump();
+
+        // Serial commands for scripting from the computer. Control characters, so a terminal
+        // echoing our own log text back can never trigger them: ^N = NEXT, ^D = drive mode, ^S = status
+        int c = getchar_timeout_us(0);
+        if (c == 0x0E) ev = 1;
+        else if (c == 0x04) ev = 2;
+        else if (c == 0x13)
+            printf("status: drive=%d host=%d vbat=%.2fV charging=%d interval=%lu\n", in_drive, usb_host_connected(),
+                   board_vbat(), board_charging(), (unsigned long)cfg.interval_min);
 
         if (!board_usb_power()) {          // unplugged: we are on battery now
             usb_drive_disable();
+            in_drive = false;
             printf("usb unplugged\n");
             arm_timer();
             power_down();
@@ -203,13 +219,14 @@ static void usb_loop(void) {
         }
 
         bool connected = usb_host_connected();
-        if (usb_drive_enabled()) {
+        if (in_drive) {
             board_led_act((now / 500) & 1);    // slow blink = drive mode
             if (!connected) { if (!host_lost_since) host_lost_since = now; }
             else host_lost_since = 0;
             bool lost = host_lost_since && now - host_lost_since > 1500;
             if (usb_drive_ejected() || ev == 1 || lost) {
                 usb_drive_disable();
+                in_drive = false;
                 board_led_act(false);
                 printf("drive mode off (%s)\n", usb_drive_ejected() ? "ejected" : ev == 1 ? "NEXT" : "disconnected");
                 sleep_ms_alive(300);
@@ -237,6 +254,10 @@ static void usb_loop(void) {
 // ------------------------------------------------------------------ main
 
 int main(void) {
+    // 200 MHz is within the RP2040's rated range (needs 1.15 V core); makes converting ~1.6x faster.
+    vreg_set_voltage(VREG_VOLTAGE_1_15);
+    sleep_ms(2);
+    set_sys_clock_khz(200000, true);
     board_init();
     bool usb_power = board_usb_power();
     bool key_wake = board_key_down();
