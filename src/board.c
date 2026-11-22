@@ -3,7 +3,8 @@
 #include "hardware/watchdog.h"
 #include "usb.h"
 
-static void out(uint pin, bool v) { gpio_init(pin); gpio_set_dir(pin, GPIO_OUT); gpio_put(pin, v); }
+// Set the level before enabling the output, so a pin never glitches to the wrong level.
+static void out(uint pin, bool v) { gpio_init(pin); gpio_put(pin, v); gpio_set_dir(pin, GPIO_OUT); }
 static void in_pullup(uint pin)   { gpio_init(pin); gpio_set_dir(pin, GPIO_IN); gpio_pull_up(pin); }
 
 void board_init(void) {

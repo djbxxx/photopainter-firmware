@@ -20,10 +20,53 @@
 #include "pcf85063.h"
 #include "ui.h"
 #include "usb.h"
+#include "ff.h"
+#include "pico/stdio/driver.h"
 
-#define FW_VERSION "1.2"
+#define FW_VERSION "1.3"
 
 enum { SCR_PICTURE = 0, SCR_NOCARD, SCR_EMPTY, SCR_LOWBAT };
+
+// ------------------------------------------------------------------ battery log
+// Everything printed is also kept in RAM that survives a watchdog reset, and on battery
+// it is appended to 0:/.cache/boot.log so problems without USB can be read afterwards.
+#define RAMLOG_SIZE 6144
+#define RAMLOG_MAGIC 0x504C4F47u
+static uint32_t __uninitialized_ram(ramlog_magic);
+static uint32_t __uninitialized_ram(ramlog_len);
+static char __uninitialized_ram(ramlog_buf)[RAMLOG_SIZE];
+
+static void ramlog_out(const char *buf, int len) {
+    for (int i = 0; i < len; i++) {
+        if (ramlog_len >= RAMLOG_SIZE) {                    // keep the newest text
+            memmove(ramlog_buf, ramlog_buf + RAMLOG_SIZE / 2, RAMLOG_SIZE / 2);
+            ramlog_len = RAMLOG_SIZE / 2;
+        }
+        ramlog_buf[ramlog_len++] = buf[i];
+    }
+}
+static stdio_driver_t ramlog_driver = {.out_chars = ramlog_out};
+
+static void ramlog_init(void) {
+    if (ramlog_magic != RAMLOG_MAGIC || ramlog_len > RAMLOG_SIZE) { ramlog_magic = RAMLOG_MAGIC; ramlog_len = 0; }
+    stdio_set_driver_enabled(&ramlog_driver, true);
+}
+
+// Append the RAM log to the card (mounts/unmounts itself) and clear it.
+static void ramlog_save(void) {
+    if (!ramlog_len || !lib_mount()) return;
+    FIL f;
+    FILINFO fi;
+    BYTE mode = FA_OPEN_APPEND | FA_WRITE;
+    if (f_stat("0:/.cache/boot.log", &fi) == FR_OK && fi.fsize > 64 * 1024) mode = FA_CREATE_ALWAYS | FA_WRITE;
+    if (f_open(&f, "0:/.cache/boot.log", mode) == FR_OK) {
+        UINT bw;
+        f_write(&f, ramlog_buf, ramlog_len, &bw);
+        f_close(&f);
+        ramlog_len = 0;
+    }
+    lib_unmount();
+}
 
 static uint8_t arena[150 * 1024];   // shared work memory for scanning and converting
 static config_t cfg;
@@ -147,10 +190,11 @@ static void load_config_only(void) {
 
 static void power_down(void) {
     epd_finish();
-    printf("power off\n");
+    printf("power off (vbat %.2fV)\n", board_vbat());
+    if (!board_usb_power()) ramlog_save();
     sleep_ms_alive(50);
     board_power_off();
-    // Still running: NEXT is held, or USB was plugged in. Wait it out.
+    // Still running: NEXT is held, or USB was plugged in.
 }
 
 // ------------------------------------------------------------------ USB mode
@@ -183,6 +227,8 @@ static void drive_on(bool reconnect) {
     in_drive = true;
     printf("drive mode on\n");
 }
+
+static void battery_still_on(void);
 
 static void usb_loop(void) {
     button_t key = {0};
@@ -219,7 +265,7 @@ static void usb_loop(void) {
             printf("usb unplugged\n");
             arm_timer();
             power_down();
-            while (!board_usb_power()) { keepalive(); sleep_ms(10); }
+            battery_still_on();
             continue;
         }
 
@@ -256,6 +302,37 @@ static void usb_loop(void) {
     }
 }
 
+// After power_down() on battery we should be dead. If we are not (NEXT still held, or the
+// power latch did not let go), keep working on battery instead of hanging: NEXT and the
+// timer still change the picture, plugging in USB switches to USB mode.
+static void battery_still_on(void) {
+    uint32_t t0 = board_millis();
+    while (board_key_down() && board_millis() - t0 < 10000) { keepalive(); sleep_ms(10); }
+    sleep_ms_alive(500);
+    if (board_usb_power()) return;
+    printf("still running on battery %lu ms after power off - latch did not cut power\n",
+           (unsigned long)(board_millis() - t0));
+    ramlog_save();
+    button_t key = {0};
+    for (;;) {
+        keepalive();
+        sleep_ms(5);
+        if (board_usb_power()) { printf("usb plugged in\n"); return; }
+        int ev = key_poll(&key);
+        bool timer = !gpio_get(PIN_RTC_INT);
+        if (ev || timer) {
+            printf("battery: %s\n", timer ? "timer" : "NEXT");
+            run_cycle(true);
+            arm_timer();
+            power_down();
+            t0 = board_millis();
+            while (board_key_down() && board_millis() - t0 < 10000) { keepalive(); sleep_ms(10); }
+            sleep_ms_alive(500);
+        }
+        board_led_act((board_millis() / 1000) % 10 == 0);   // short blink every 10 s: alive
+    }
+}
+
 // ------------------------------------------------------------------ main
 
 int main(void) {
@@ -264,10 +341,12 @@ int main(void) {
     sleep_ms(2);
     set_sys_clock_khz(200000, true);
     board_init();
+    board_led_act(true);   // first sign of life
     bool usb_power = board_usb_power();
     bool key_wake = board_key_down();
     usb_init();
     stdio_init_all();
+    ramlog_init();
     bool wd = watchdog_caused_reboot();
     watchdog_enable(8000, true);
     pcf_init();
@@ -297,7 +376,7 @@ int main(void) {
             arm_timer();
             power_down();
         }
-        while (!board_usb_power()) { keepalive(); sleep_ms(10); }   // NEXT still held
+        battery_still_on();
     }
     usb_loop();
 }
