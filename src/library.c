@@ -9,6 +9,7 @@
 #include "hw_config.h"
 #include "pico/rand.h"
 #include "convert.h"
+#include "collage.h"
 #include "epd.h"
 #include "board.h"
 
@@ -17,7 +18,7 @@
 #define INDEX_PATH "0:/.cache/index.txt"
 #define INDEX_TMP  "0:/.cache/index.new"
 #define STATE_PATH "0:/.cache/state.txt"
-#define TMP_PATH   "0:/.cache/tmp.bin"
+#define TMP_PATH   "0:/.cache/tmp"
 #define ERR_PATH   "0:/photopainter-errors.txt"
 #define MAX_PICS   1000
 #define ST_TODO    255
@@ -27,6 +28,7 @@ typedef struct {
     uint16_t fdate, ftime;
     uint8_t status;    // cv_result_t, or ST_TODO
     uint8_t fresh;     // converted during this sync
+    uint8_t portrait;  // photo is taller than wide (after EXIF rotation)
 } entry_t;
 
 static entry_t ents[MAX_PICS];
@@ -49,8 +51,15 @@ static uint32_t fnv1a(const char *s) {
     return h;
 }
 
-static void cache_path(char *buf, size_t n, uint32_t hash) {
-    snprintf(buf, n, CACHE_DIR "/%08lx.epd", (unsigned long)hash);
+// ext: "epd" = full screen, "q" = collage quarter tile, "s" = collage strip tile
+static void cache_file(char *buf, size_t n, uint32_t hash, const char *ext) {
+    snprintf(buf, n, CACHE_DIR "/%08lx.%s", (unsigned long)hash, ext);
+}
+static void cache_path(char *buf, size_t n, uint32_t hash) { cache_file(buf, n, hash, "epd"); }
+
+static bool file_has_size(const char *path, FSIZE_t size) {
+    FILINFO fi;
+    return f_stat(path, &fi) == FR_OK && fi.fsize == size;
 }
 
 static bool is_picture_name(const char *n) {
@@ -107,6 +116,12 @@ bool lib_mount(void) {
     }
     sd->mounted = true;
     f_mkdir(CACHE_DIR);
+    // Tell macOS Spotlight not to index the card: indexing writes junk to it and blocks ejecting.
+    FILINFO fi;
+    if (f_stat("0:/.metadata_never_index", &fi) != FR_OK) {
+        FIL f;
+        if (f_open(&f, "0:/.metadata_never_index", FA_CREATE_NEW | FA_WRITE) == FR_OK) f_close(&f);
+    }
     state_load();
     return true;
 }
@@ -119,7 +134,7 @@ void lib_unmount(void) {
 
 // ------------------------------------------------------------------ sync
 
-typedef struct { uint32_t hash, size; uint16_t fdate, ftime; uint8_t status; } old_t;
+typedef struct { uint32_t hash, size; uint16_t fdate, ftime; uint8_t status, portrait; } old_t;
 static const char *g_pool;
 static const uint32_t *g_name_off;
 
@@ -132,7 +147,7 @@ static bool write_index(const char *path, int sig, const char *pool, const uint3
                         FIL *names_from) {
     FIL f;
     if (f_open(&f, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return false;
-    f_printf(&f, "PPv1 %d\n", sig);
+    f_printf(&f, "PPv2 %d\n", sig);
     static char line[320];
     for (int k = 0; k < nents; k++) {
         const char *name;
@@ -140,13 +155,13 @@ static bool write_index(const char *path, int sig, const char *pool, const uint3
         else {   // copy names from the previous index file, in the same order
             if (!f_gets(line, sizeof line, names_from)) break;
             char *p = line;
-            for (int i = 0; i < 5 && p; i++) p = strchr(p + (i ? 1 : 0), ' ');
+            for (int i = 0; i < 6 && p; i++) p = strchr(p + (i ? 1 : 0), ' ');
             name = p ? p + 1 : "";
             line[strcspn(line, "\n")] = 0;
         }
         const entry_t *e = &ents[k];
-        f_printf(&f, "%08lx %lu %u %u %u %s\n", (unsigned long)e->hash, (unsigned long)e->size, e->fdate, e->ftime,
-                 e->status, name);
+        f_printf(&f, "%08lx %lu %u %u %u %u %s\n", (unsigned long)e->hash, (unsigned long)e->size, e->fdate, e->ftime,
+                 e->status, e->portrait, name);
     }
     return f_close(&f) == FR_OK;
 }
@@ -157,7 +172,7 @@ static bool index_next_name(FIL *f, char *name, size_t n) {
     if (!f_gets(line, sizeof line, f)) return false;
     line[strcspn(line, "\n")] = 0;
     char *p = line;
-    for (int i = 0; i < 5 && p; i++) p = strchr(p + (i ? 1 : 0), ' ');
+    for (int i = 0; i < 6 && p; i++) p = strchr(p + (i ? 1 : 0), ' ');
     snprintf(name, n, "%s", p ? p + 1 : "");
     return true;
 }
@@ -176,14 +191,18 @@ bool lib_sync(const config_t *cfg, uint8_t *arena, size_t arena_size, lib_progre
     if (f_open(&f, INDEX_PATH, FA_READ) == FR_OK) {
         char line[320];
         int osig = -1;
-        if (f_gets(line, sizeof line, &f) && sscanf(line, "PPv1 %d", &osig) == 1 && osig == sig) {
+        bool v2 = f_gets(line, sizeof line, &f) && sscanf(line, "PPv2 %d", &osig) == 1;
+        if (v2 && osig == sig) {
             while (nold < MAX_PICS && f_gets(line, sizeof line, &f)) {
                 unsigned long h, sz;
-                unsigned d, t, s;
-                if (sscanf(line, "%lx %lu %u %u %u", &h, &sz, &d, &t, &s) == 5)
-                    olds[nold++] = (old_t){(uint32_t)h, (uint32_t)sz, (uint16_t)d, (uint16_t)t, (uint8_t)s};
+                unsigned d, t, s, pt;
+                if (sscanf(line, "%lx %lu %u %u %u %u", &h, &sz, &d, &t, &s, &pt) == 6)
+                    olds[nold++] = (old_t){(uint32_t)h, (uint32_t)sz, (uint16_t)d, (uint16_t)t, (uint8_t)s, (uint8_t)pt};
             }
-        } else if (osig != -1) {
+        } else if (!v2) {
+            printf("lib: new cache format (collage tiles), converting everything again\n");
+            out->changed = true;
+        } else {
             printf("lib: settings changed, converting everything again\n");
             out->changed = true;
         }
@@ -211,7 +230,7 @@ bool lib_sync(const config_t *cfg, uint8_t *arena, size_t arena_size, lib_progre
             memcpy(pool + pool_used, fi.fname, len);
             off[n] = pool_used;
             pool_used += len;
-            raw[n] = (entry_t){fnv1a(fi.fname), (uint32_t)fi.fsize, fi.fdate, fi.ftime, ST_TODO, 0};
+            raw[n] = (entry_t){fnv1a(fi.fname), (uint32_t)fi.fsize, fi.fdate, fi.ftime, ST_TODO, 0, 0};
             order[n] = n;
             n++;
             keepalive();
@@ -230,9 +249,15 @@ bool lib_sync(const config_t *cfg, uint8_t *arena, size_t arena_size, lib_progre
         for (int j = 0; j < nold; j++) {
             if (olds[j].hash == e.hash && olds[j].size == e.size && olds[j].fdate == e.fdate && olds[j].ftime == e.ftime) {
                 e.status = olds[j].status;
-                if (e.status == CV_OK) {
-                    cache_path(path, sizeof path, e.hash);
-                    if (f_stat(path, &fi) != FR_OK || fi.fsize != EPD_FRAME_BYTES) e.status = ST_TODO;
+                e.portrait = olds[j].portrait;
+                if (e.status == CV_OK) {   // all three cache files must still be there
+                    cache_file(path, sizeof path, e.hash, "epd");
+                    bool ok = file_has_size(path, EPD_FRAME_BYTES);
+                    cache_file(path, sizeof path, e.hash, "q");
+                    ok = ok && file_has_size(path, TILE_Q_W * TILE_Q_H / 2);
+                    cache_file(path, sizeof path, e.hash, "s");
+                    ok = ok && file_has_size(path, TILE_S_W * TILE_S_H / 2);
+                    if (!ok) e.status = ST_TODO;
                 }
                 break;
             }
@@ -249,7 +274,9 @@ bool lib_sync(const config_t *cfg, uint8_t *arena, size_t arena_size, lib_progre
     if (f_opendir(&dir, CACHE_DIR) == FR_OK) {
         while (f_readdir(&dir, &fi) == FR_OK && fi.fname[0]) {
             unsigned long h;
-            if (strlen(fi.fname) != 12 || sscanf(fi.fname, "%8lx.epd", &h) != 1) continue;
+            char ext[8] = {0};
+            if (strlen(fi.fname) < 10 || fi.fname[8] != '.' || sscanf(fi.fname, "%8lx.%7s", &h, ext) != 2) continue;
+            if (strcmp(ext, "epd") && strcmp(ext, "q") && strcmp(ext, "s")) continue;
             bool used_h = false;
             for (int k = 0; k < n && !used_h; k++) used_h = ents[k].hash == (uint32_t)h;
             if (!used_h) {
@@ -262,21 +289,28 @@ bool lib_sync(const config_t *cfg, uint8_t *arena, size_t arena_size, lib_progre
 
     // 5. convert what is new or changed (the arena is reused by the converter from here on)
     if (todo) {
-        convert_opts_t o = {.fit = cfg->fit, .saturation = cfg->saturation, .rotate = cfg->rotate,
-                            .background = C_WHITE};
+        convert_opts_t o = {.saturation = cfg->saturation, .rotate = cfg->rotate, .background = C_WHITE};
         FIL idx;
         int done = 0;
         if (f_open(&idx, INDEX_PATH, FA_READ) == FR_OK) {
-            static char line[320], name[260], src[300], dst[40];
+            static char line[320], name[260], src[300], dst[3][40];
             f_gets(line, sizeof line, &idx);   // header
             for (int k = 0; k < n && index_next_name(&idx, name, sizeof name); k++) {
                 if (ents[k].status != ST_TODO) continue;
                 if (cb) cb(done, todo, name);
                 snprintf(src, sizeof src, PIC_DIR "/%s", name);
-                cache_path(dst, sizeof dst, ents[k].hash);
+                cache_file(dst[0], sizeof dst[0], ents[k].hash, "epd");
+                cache_file(dst[1], sizeof dst[1], ents[k].hash, "q");
+                cache_file(dst[2], sizeof dst[2], ents[k].hash, "s");
+                // one decode -> full screen picture + both collage tile shapes
+                cv_output_t outs[3] = {{dst[0], EPD_W, EPD_H, cfg->fit},
+                                       {dst[1], TILE_Q_W, TILE_Q_H, 0},
+                                       {dst[2], TILE_S_W, TILE_S_H, 0}};
                 board_led_act(true);
                 uint32_t t0 = board_millis();
-                cv_result_t r = convert_image(src, dst, TMP_PATH, &o, arena, arena_size);
+                uint8_t portrait = 0;
+                cv_result_t r = convert_image(src, outs, 3, TMP_PATH, &o, arena, arena_size, &portrait);
+                ents[k].portrait = portrait;
                 board_led_act(false);
                 printf("lib: %s -> %s (%lu ms)\n", name, convert_strerror(r), (unsigned long)(board_millis() - t0));
                 ents[k].status = (uint8_t)r;
@@ -375,6 +409,45 @@ int lib_pick_next(const config_t *cfg, const lib_summary_t *s) {
 }
 
 const char *lib_last_name(void) { return last_name; }
+
+static void epd_sink(const uint8_t *row, int len) { epd_write(row, len); keepalive(); }
+static uint32_t rnd32(void) { return get_rand_32(); }
+
+bool lib_show_collage(const config_t *cfg) {
+    static uint8_t pref[MAX_PICS], elig[MAX_PICS];
+    // Tile shapes in the frame's own orientation: on a portrait-hung frame the quarter
+    // tiles are tall and the strips are wide, so the preference flips.
+    bool frame_portrait = cfg->rotate == 90 || cfg->rotate == 270;
+    int ok = 0;
+    for (int k = 0; k < nents; k++) {
+        elig[k] = ents[k].status == CV_OK;
+        ok += elig[k];
+        pref[k] = (ents[k].portrait != frame_portrait) ? TILE_S : TILE_Q;
+    }
+    if (ok < 4) return false;
+    int pick[4];
+    int layout = collage_choose(pref, elig, nents, rnd32, pick);
+    if (layout < 0) return false;
+    static char paths[4][40];
+    const char *pp[4];
+    const collage_slot_t *sl = collage_slots(layout);
+    for (int s = 0; s < 4; s++) {
+        cache_file(paths[s], sizeof paths[s], ents[pick[s]].hash, sl[s].tile == TILE_Q ? "q" : "s");
+        if (!file_has_size(paths[s], sl[s].tile == TILE_Q ? TILE_Q_W * TILE_Q_H / 2 : TILE_S_W * TILE_S_H / 2)) {
+            printf("collage: missing tile %s\n", paths[s]);
+            return false;
+        }
+        pp[s] = paths[s];
+    }
+    printf("show: collage %s of #%d #%d #%d #%d\n", collage_layout_name(layout), pick[0], pick[1], pick[2], pick[3]);
+    epd_begin();
+    bool okc = collage_compose(layout, pp, epd_sink);
+    epd_end(true);
+    st.screen = 0;  // st.shown keeps the last single photo, so the normal order continues after the collage
+    state_save();
+    snprintf(last_name, sizeof last_name, "collage");
+    return okc;
+}
 
 bool lib_show(int k) {
     if (k < 0 || k >= nents) return false;

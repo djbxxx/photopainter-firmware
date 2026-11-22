@@ -9,7 +9,7 @@ add_subdirectory(lib/FatFs_SPI)
 
 add_executable(photopainter
     src/main.c src/board.c src/epd.c src/pcf85063.c src/usb.c src/hw_config.c
-    src/convert.c src/ui.c src/config.c src/library.c
+    src/convert.c src/ui.c src/config.c src/library.c src/collage.c
     lib/tjpgd/tjpgd.c lib/fonts/font24.c lib/fonts/font16.c)
 
 target_include_directories(photopainter PRIVATE src lib/tjpgd lib/fonts)

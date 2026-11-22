@@ -2,7 +2,7 @@
 """Talk to the PhotoPainter custom firmware over USB serial.
 
   ppctl.py log [seconds]      print the frame's log (default: until Ctrl-C)
-  ppctl.py next               show the next picture
+  ppctl.py next [--wait]      show the next picture (--wait: log until it is on screen)
   ppctl.py drive              switch the SD card back to USB drive mode
   ppctl.py status             print battery/charging/drive status
 Needs: pip install pyserial
@@ -23,14 +23,17 @@ def port():
     return ports[0]
 
 
-def follow(s, seconds):
+def follow(s, seconds, until=None):
     end = time.time() + seconds if seconds else None
     buf = b""
     while end is None or time.time() < end:
         buf += s.read(256)
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
-            print(line.decode(errors="replace").rstrip("\r"), flush=True)
+            text = line.decode(errors="replace").rstrip("\r")
+            print(text, flush=True)
+            if until and until in text:
+                return
 
 
 def main():
@@ -42,8 +45,10 @@ def main():
             follow(s, float(sys.argv[2]) if len(sys.argv) > 2 else 0)
         else:
             s.write(CMDS[cmd])
+            wait = "--wait" in sys.argv
             try:
-                follow(s, 2 if cmd == "status" else 1)
+                # a picture change ends with re-arming the timer
+                follow(s, 120 if wait else (2 if cmd == "status" else 1), "rtc: alarm" if wait else None)
             except serial.SerialException:
                 pass  # "drive" reconnects USB, which closes the serial port
 

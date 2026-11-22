@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
+#include "pico/rand.h"
 #include "hardware/watchdog.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
@@ -20,7 +21,7 @@
 #include "ui.h"
 #include "usb.h"
 
-#define FW_VERSION "1.1"
+#define FW_VERSION "1.2"
 
 enum { SCR_PICTURE = 0, SCR_NOCARD, SCR_EMPTY, SCR_LOWBAT };
 
@@ -124,8 +125,12 @@ static void run_cycle(bool advance) {
             lib_screen_set(SCR_EMPTY);
         }
     } else if (advance || ls.changed || progress_on_screen || lib_screen_get() != SCR_PICTURE) {
-        int k = lib_pick_next(&cfg, &ls);
-        if (k >= 0) lib_show(k);
+        // New pictures are always shown on their own first; otherwise roll for a collage.
+        bool collage = ls.first_new < 0 && ls.ok >= 4 && cfg.collage > 0 && (int)(get_rand_32() % 100) < cfg.collage;
+        if (!(collage && lib_show_collage(&cfg))) {
+            int k = lib_pick_next(&cfg, &ls);
+            if (k >= 0) lib_show(k);
+        }
     } else {
         printf("nothing changed, picture stays\n");
     }

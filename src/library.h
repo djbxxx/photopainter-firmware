@@ -24,6 +24,7 @@ void lib_unmount(void);
 bool lib_sync(const config_t *cfg, uint8_t *arena, size_t arena_size, lib_progress_cb cb, lib_summary_t *out);
 int  lib_pick_next(const config_t *cfg, const lib_summary_t *s);   // -1 if nothing to show
 bool lib_show(int idx);          // upload the cached frame and refresh the panel (blocking)
+bool lib_show_collage(const config_t *cfg);   // random 4-photo collage; false if < 4 photos
 const char *lib_last_name(void); // file name of the picture last passed to lib_show
 
 // Small persistent flags (stored in 0:/.cache/state.txt)

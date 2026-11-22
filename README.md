@@ -7,7 +7,12 @@ Replacement firmware for the Waveshare PhotoPainter (RP2040, 7.3" 7-color e-pape
   A progress screen is shown when two or more pictures need converting.
 - USB to a computer: the SD card shows up as a drive. Copy pictures, eject -> the frame updates.
 - NEXT: next picture. Hold NEXT 2 s (on USB): drive mode again.
-- `config.txt` (created on first start): interval, order (shuffle/sequential), fill/fit, saturation, orientation.
+- `config.txt` (created on first start): interval, order (shuffle/sequential), fill/fit, saturation,
+  orientation (landscape, landscape-flipped, portrait, portrait-flipped), collage (percent).
+- Collages: `collage = 33` means about 1 in 3 changes shows 4 random photos with black lines between them.
+  Layout follows the photos: 2x2 grid (landscape), 4 strips (portrait) or 2 strips + 2 tiles (mixed).
+  Tiles are made at conversion time (one decode -> full picture + both tile shapes), so a collage shows instantly.
+- Only files directly in `pic/` are used: subfolders (e.g. `pic/inactive/`) are ignored, so pictures can be parked there.
 - Problems with files are listed in `photopainter-errors.txt` on the card.
 
 Build: `./build.sh` -> `build/photopainter.uf2`

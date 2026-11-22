@@ -8,6 +8,7 @@ typedef struct {
     uint8_t  fit;            // 0 = crop to fill, 1 = whole picture with borders
     uint8_t  saturation;     // 0..100
     uint16_t rotate;         // clockwise degrees applied to pictures and screens
+    uint8_t  collage;        // percent of picture changes that show a 4-photo collage (0..100)
 } config_t;
 
 void config_defaults(config_t *c);

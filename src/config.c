@@ -1,5 +1,6 @@
 #include "config.h"
 #include <ctype.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +25,11 @@ static const char DEFAULT_TEXT[] =
     "saturation = 50\r\n"
     "\r\n"
     "# How the frame hangs: landscape, portrait, landscape-flipped, portrait-flipped\r\n"
-    "orientation = landscape\r\n";
+    "orientation = landscape\r\n"
+    "\r\n"
+    "# Collages: percent of picture changes that show 4 random photos with black lines\r\n"
+    "# between them (0 = never, 100 = always). Needs at least 4 pictures.\r\n"
+    "collage = 33\r\n";
 
 void config_defaults(config_t *c) {
     c->interval_min = 12 * 60;
@@ -32,6 +37,7 @@ void config_defaults(config_t *c) {
     c->fit = 0;
     c->saturation = 50;
     c->rotate = 0;
+    c->collage = 33;
 }
 
 static char *trim(char *s) {
@@ -70,6 +76,7 @@ void config_load(config_t *c) {
         return;
     }
     char line[160];
+    bool seen_collage = false;
     while (f_gets(line, sizeof line, &f)) {
         char *s = trim(line);
         if (!*s || *s == '#') continue;
@@ -83,6 +90,7 @@ void config_load(config_t *c) {
         else if (!strcmp(k, "order")) c->shuffle = !strncmp(v, "shuf", 4) || !strncmp(v, "rand", 4);
         else if (!strcmp(k, "fit")) c->fit = !strcmp(v, "fit") || !strcmp(v, "contain") || !strcmp(v, "whole");
         else if (!strcmp(k, "saturation")) { int n = atoi(v); c->saturation = n < 0 ? 0 : n > 100 ? 100 : n; }
+        else if (!strcmp(k, "collage")) { seen_collage = true; int n = atoi(v); c->collage = n < 0 ? 0 : n > 100 ? 100 : n; }
         else if (!strcmp(k, "orientation")) {
             if (!strcmp(v, "portrait")) c->rotate = 270;
             else if (!strcmp(v, "portrait-flipped")) c->rotate = 90;
@@ -91,6 +99,17 @@ void config_load(config_t *c) {
         }
     }
     f_close(&f);
-    printf("config: interval %lu min, %s, %s, saturation %d, rotate %d\n", (unsigned long)c->interval_min,
-           c->shuffle ? "shuffle" : "sequential", c->fit ? "fit" : "fill", c->saturation, c->rotate);
+    if (!seen_collage && f_open(&f, CONFIG_PATH, FA_OPEN_APPEND | FA_WRITE) == FR_OK) {
+        // Older config.txt (before collages existed): add the setting so it can be found.
+        static const char add[] =
+            "\r\n# Collages: percent of picture changes that show 4 random photos with black lines\r\n"
+            "# between them (0 = never, 100 = always). Needs at least 4 pictures.\r\n"
+            "collage = 33\r\n";
+        UINT bw;
+        f_write(&f, add, sizeof add - 1, &bw);
+        f_close(&f);
+        printf("config: added collage setting\n");
+    }
+    printf("config: interval %lu min, %s, %s, saturation %d, rotate %d, collage %d%%\n", (unsigned long)c->interval_min,
+           c->shuffle ? "shuffle" : "sequential", c->fit ? "fit" : "fill", c->saturation, c->rotate, c->collage);
 }

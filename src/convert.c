@@ -48,9 +48,10 @@ static const uint8_t PAL_REAL[C_NUM][3] = {
 // ------------------------------------------------------------------ pipeline
 //
 // Stage A works in *source orientation*: the decoder delivers source rows top to
-// bottom, they are box-averaged into Aw x Ah output rows (Aw x Ah is the panel size,
+// bottom, they are box-averaged into Aw x Ah output rows (Aw x Ah is the output size,
 // swapped when the picture must be turned 90/270), and each output row is dithered
 // immediately. Rotation is applied when the dithered rows are written out.
+// Several outputs (full screen + collage tiles) are fed from one decode.
 
 typedef struct {
     int Aw, Ah;                 // output size in source orientation
@@ -175,10 +176,10 @@ static void feed_row(pipe_t *p, const uint8_t *src, int i) {
 }
 
 // Work out crop/placement for a source of sw x sh pixels and allocate buffers.
-static cv_result_t pipe_setup(pipe_t *p, arena_t *ar, int sw, int sh, const convert_opts_t *o) {
+static cv_result_t pipe_setup(pipe_t *p, arena_t *ar, int sw, int sh, int fit, const convert_opts_t *o) {
     int Aw = p->Aw, Ah = p->Ah;
     int cx = 0, cy = 0, cw = sw, ch = sh;
-    if (o->fit == 0) {                       // crop to fill
+    if (fit == 0) {                          // crop to fill
         p->ox = p->oy = 0; p->iw = Aw; p->ih = Ah;
         if ((int64_t)sw * Ah > (int64_t)sh * Aw) { cw = (int)((int64_t)sh * Aw / Ah); cx = (sw - cw) / 2; }
         else                                    { ch = (int)((int64_t)sw * Ah / Aw); cy = (sh - ch) / 2; }
@@ -220,11 +221,30 @@ static cv_result_t pipe_setup(pipe_t *p, arena_t *ar, int sw, int sh, const conv
     return CV_OK;
 }
 
+// ------------------------------------------------------------------ multiple outputs
+
+#define MAX_OUT 3
+typedef struct { pipe_t *p[MAX_OUT]; int n; } multi_t;
+
+static bool all_done(const multi_t *m) {
+    for (int k = 0; k < m->n; k++) if (!pipe_done(m->p[k])) return false;
+    return true;
+}
+static void feed_all(multi_t *m, const uint8_t *row, int i) {
+    for (int k = 0; k < m->n; k++) if (!pipe_done(m->p[k])) feed_row(m->p[k], row, i);
+}
+
+// Decode-scale ratio an output needs: how many source pixels per output pixel.
+static double need_ratio(int W, int H, int Aw, int Ah, int fit) {
+    double rw = (double)W / Aw, rh = (double)H / Ah;
+    return fit == 0 ? (rw < rh ? rw : rh) : (rw > rh ? rw : rh);
+}
+
 // ------------------------------------------------------------------ JPEG
 
 typedef struct {
     FIL *f;
-    pipe_t *p;
+    multi_t *m;
     uint8_t *band;
     int sw;
     unsigned blocks;
@@ -248,9 +268,9 @@ static int jpg_out(JDEC *jd, void *bitmap, JRECT *r) {
         memcpy(c->band + ((size_t)y * c->sw + r->left) * 3, s + (size_t)y * w * 3, (size_t)w * 3);
     if ((++c->blocks & 63) == 0) keepalive();
     if (r->right == c->sw - 1) {             // band of rows complete
-        for (int y = 0; y < h; y++) feed_row(c->p, c->band + (size_t)y * c->sw * 3, r->top + y);
+        for (int y = 0; y < h; y++) feed_all(c->m, c->band + (size_t)y * c->sw * 3, r->top + y);
         keepalive();
-        if (pipe_done(c->p)) return 0;       // stop decoding: everything we need is done
+        if (all_done(c->m)) return 0;        // stop decoding: everything we need is done
     }
     return 1;
 }
@@ -297,27 +317,62 @@ static int jpeg_exif_rotation(FIL *f) {
     return 0;
 }
 
-static cv_result_t do_jpeg(FIL *f, pipe_t *p, arena_t *ar, const convert_opts_t *o) {
-    int exif = jpeg_exif_rotation(f);
-    f_lseek(f, 0);
-    p->rot = (exif + o->rotate) % 360;
-    p->Aw = (p->rot == 90 || p->rot == 270) ? EPD_H : EPD_W;
-    p->Ah = (p->rot == 90 || p->rot == 270) ? EPD_W : EPD_H;
+// Frame size from the SOF marker. Returns 1 = baseline, 2 = progressive, 0 = not found.
+static int jpeg_size(FIL *f, int *W, int *H) {
+    uint8_t b[9];
+    UINT br;
+    f_lseek(f, 2);
+    for (int guard = 0; guard < 64; guard++) {
+        if (f_read(f, b, 4, &br) != FR_OK || br != 4 || b[0] != 0xFF) return 0;
+        int marker = b[1], len = (b[2] << 8) | b[3];
+        if (marker == 0xDA || marker == 0xD9) return 0;
+        if (marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC) {
+            if (f_read(f, b, 5, &br) != FR_OK || br != 5) return 0;
+            *H = (b[1] << 8) | b[2];
+            *W = (b[3] << 8) | b[4];
+            return (marker == 0xC0 || marker == 0xC1) ? 1 : 2;
+        }
+        if (f_lseek(f, f_tell(f) + len - 2) != FR_OK) return 0;
+    }
+    return 0;
+}
 
-    jctx_t c = {.f = f, .p = p};
+typedef struct {
+    const cv_output_t *outs;
+    int nout;
+    const convert_opts_t *o;
+    multi_t m;
+    int rot;
+    uint8_t portrait;
+} job_t;
+
+static cv_result_t setup_all(job_t *j, arena_t *ar, int sw, int sh) {
+    for (int k = 0; k < j->nout; k++) {
+        cv_result_t r = pipe_setup(j->m.p[k], ar, sw, sh, j->outs[k].fit, j->o);
+        if (r) return r;
+    }
+    return CV_OK;
+}
+
+static cv_result_t do_jpeg(FIL *f, job_t *j, arena_t *ar) {
+    jctx_t c = {.f = f, .m = &j->m};
     JDEC jd;
     size_t pool_sz = 10 * 1024;
     void *pool = aalloc(ar, pool_sz);
     if (!pool) return CV_ERR_TOOBIG;
+    f_lseek(f, 0);
     JRESULT jr = jd_prepare(&jd, jpg_in, pool, pool_sz, &c);
     if (jr == JDR_FMT3) return CV_ERR_PROGRESSIVE;
     if (jr == JDR_MEM1 || jr == JDR_MEM2) return CV_ERR_TOOBIG;
     if (jr != JDR_OK) return CV_ERR_CORRUPT;
 
     int W = jd.width, H = jd.height;
-    // Largest 1/2^s decode scale that still leaves at least panel resolution.
-    double rw = (double)W / p->Aw, rh = (double)H / p->Ah;
-    double r = o->fit == 0 ? (rw < rh ? rw : rh) : (rw > rh ? rw : rh);
+    double r = 1e9;   // the most demanding output decides the decode scale
+    for (int k = 0; k < j->nout; k++) {
+        pipe_t *p = j->m.p[k];
+        double rk = need_ratio(W, H, p->Aw, p->Ah, j->outs[k].fit);
+        if (rk < r) r = rk;
+    }
     int s = 0;
     while (s < 3 && r / (1 << (s + 1)) >= 1.0) s++;
     int mx = 8 * jd.msx, my = 8 * jd.msy;
@@ -325,17 +380,22 @@ static cv_result_t do_jpeg(FIL *f, pipe_t *p, arena_t *ar, const convert_opts_t 
     int sh = ((H - H % my) >> s) + ((H % my) >> s);
     int bandh = my >> s;
     if (bandh < 1) bandh = 1;
-    printf("jpeg %dx%d exif %d -> scale 1/%d = %dx%d, rot %d\n", W, H, exif, 1 << s, sw, sh, p->rot);
+    printf("jpeg %dx%d -> scale 1/%d = %dx%d, rot %d, %d outputs\n", W, H, 1 << s, sw, sh, j->rot, j->nout);
+    bool turned_src = j->rot == 90 || j->rot == 270;   // (includes frame rotation; only used for log)
+    (void)turned_src;
 
-    cv_result_t cr = pipe_setup(p, ar, sw, sh, o);
+    cv_result_t cr = setup_all(j, ar, sw, sh);
     if (cr) return cr;
     c.sw = sw;
     c.band = aalloc(ar, (size_t)sw * bandh * 3);
     if (!c.band) return CV_ERR_TOOBIG;
     jr = jd_decomp(&jd, jpg_out, (uint8_t)s);
-    if (p->err) return p->err;
+    for (int k = 0; k < j->nout; k++) {
+        pipe_t *p = j->m.p[k];
+        if (p->err) return p->err;
+        if (p->cur < p->ih) return CV_ERR_CORRUPT;
+    }
     if (jr != JDR_OK && jr != JDR_INTR) return CV_ERR_CORRUPT;
-    if (p->cur < p->ih) return CV_ERR_CORRUPT;
     return CV_OK;
 }
 
@@ -344,33 +404,37 @@ static cv_result_t do_jpeg(FIL *f, pipe_t *p, arena_t *ar, const convert_opts_t 
 static uint32_t le32(const uint8_t *q) { return q[0] | q[1] << 8 | q[2] << 16 | (uint32_t)q[3] << 24; }
 static uint16_t le16(const uint8_t *q) { return (uint16_t)(q[0] | q[1] << 8); }
 
-static cv_result_t do_bmp(FIL *f, pipe_t *p, arena_t *ar, const convert_opts_t *o) {
+typedef struct { int32_t W, H; int bpp; uint32_t off, dib, comp, ncol; bool bottom_up; } bmp_t;
+
+static cv_result_t bmp_header(FIL *f, bmp_t *b) {
     uint8_t h[54];
     UINT br;
     f_lseek(f, 0);
     if (f_read(f, h, 54, &br) != FR_OK || br != 54) return CV_ERR_CORRUPT;
-    uint32_t off = le32(h + 10), dib = le32(h + 14);
-    int32_t W = (int32_t)le32(h + 18), H = (int32_t)le32(h + 22);
-    int bpp = le16(h + 28);
-    uint32_t comp = le32(h + 30), ncol = le32(h + 46);
-    bool bottom_up = H > 0;
-    if (H < 0) H = -H;
-    if (W <= 0 || H <= 0) return CV_ERR_CORRUPT;
-    if (W > 12000 || H > 12000) return CV_ERR_TOOBIG;
-    if (!(comp == 0 || (comp == 3 && bpp == 32))) return CV_ERR_UNSUPPORTED;
-    if (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 24 && bpp != 32) return CV_ERR_UNSUPPORTED;
+    b->off = le32(h + 10); b->dib = le32(h + 14);
+    b->W = (int32_t)le32(h + 18); b->H = (int32_t)le32(h + 22);
+    b->bpp = le16(h + 28);
+    b->comp = le32(h + 30); b->ncol = le32(h + 46);
+    b->bottom_up = b->H > 0;
+    if (b->H < 0) b->H = -b->H;
+    if (b->W <= 0 || b->H <= 0) return CV_ERR_CORRUPT;
+    if (b->W > 12000 || b->H > 12000) return CV_ERR_TOOBIG;
+    if (!(b->comp == 0 || (b->comp == 3 && b->bpp == 32))) return CV_ERR_UNSUPPORTED;
+    if (b->bpp != 1 && b->bpp != 4 && b->bpp != 8 && b->bpp != 24 && b->bpp != 32) return CV_ERR_UNSUPPORTED;
+    return CV_OK;
+}
 
-    p->rot = o->rotate % 360;
-    p->Aw = (p->rot == 90 || p->rot == 270) ? EPD_H : EPD_W;
-    p->Ah = (p->rot == 90 || p->rot == 270) ? EPD_W : EPD_H;
-    cv_result_t cr = pipe_setup(p, ar, W, H, o);
+static cv_result_t do_bmp(FIL *f, const bmp_t *b, job_t *j, arena_t *ar) {
+    UINT br;
+    int W = b->W, H = b->H, bpp = b->bpp;
+    cv_result_t cr = setup_all(j, ar, W, H);
     if (cr) return cr;
 
     static uint8_t pal[256][3];
     if (bpp <= 8) {
-        if (!ncol) ncol = 1u << bpp;
+        uint32_t ncol = b->ncol ? b->ncol : 1u << bpp;
         if (ncol > 256) ncol = 256;
-        f_lseek(f, 14 + dib);
+        f_lseek(f, 14 + b->dib);
         for (uint32_t i = 0; i < ncol; i++) {
             uint8_t q[4];
             f_read(f, q, 4, &br);
@@ -380,12 +444,13 @@ static cv_result_t do_bmp(FIL *f, pipe_t *p, arena_t *ar, const convert_opts_t *
     uint32_t stride = ((uint32_t)W * bpp + 31) / 32 * 4;
     uint8_t *raw = aalloc(ar, stride), *row = aalloc(ar, (size_t)W * 3);
     if (!raw || !row) return CV_ERR_TOOBIG;
-    printf("bmp %ldx%ld %dbpp rot %d\n", (long)W, (long)H, bpp, p->rot);
+    printf("bmp %ldx%ld %dbpp rot %d, %d outputs\n", (long)W, (long)H, bpp, j->rot, j->nout);
 
-    for (int y = 0; y < H && !pipe_done(p); y++) {
-        if (y < p->rs[0]) continue;          // above the crop
-        int fy = bottom_up ? H - 1 - y : y;
-        if (f_lseek(f, off + (FSIZE_t)fy * stride) != FR_OK ||
+    int first = H;
+    for (int k = 0; k < j->nout; k++) if (j->m.p[k]->rs[0] < first) first = j->m.p[k]->rs[0];
+    for (int y = first; y < H && !all_done(&j->m); y++) {
+        int fy = b->bottom_up ? H - 1 - y : y;
+        if (f_lseek(f, b->off + (FSIZE_t)fy * stride) != FR_OK ||
             f_read(f, raw, stride, &br) != FR_OK || br != stride) return CV_ERR_CORRUPT;
         uint8_t *d = row;
         for (int x = 0; x < W; x++, d += 3) {
@@ -397,62 +462,68 @@ static cv_result_t do_bmp(FIL *f, pipe_t *p, arena_t *ar, const convert_opts_t *
                 d[0] = pal[idx][0]; d[1] = pal[idx][1]; d[2] = pal[idx][2];
             }
         }
-        feed_row(p, row, y);
+        feed_all(&j->m, row, y);
         if ((y & 15) == 0) keepalive();
     }
-    if (p->err) return p->err;
-    return p->cur < p->ih ? CV_ERR_CORRUPT : CV_OK;
+    for (int k = 0; k < j->nout; k++) {
+        pipe_t *p = j->m.p[k];
+        if (p->err) return p->err;
+        if (p->cur < p->ih) return CV_ERR_CORRUPT;
+    }
+    return CV_OK;
 }
 
 // ------------------------------------------------------------------ rotate 90/270
 
-// tmp holds Aw=480 x Ah=800 packed rows (source orientation); write the turned 800x480 frame.
-static cv_result_t transpose(FIL *tmp, FIL *dst, int rot, arena_t *ar) {
-    const int SW = EPD_H, SH = EPD_W, srb = SW / 2;   // 480 x 800 source
+// tmp holds SW x SH packed rows (source orientation); write the turned SH x SW result.
+static cv_result_t transpose(FIL *tmp, FIL *dst, int rot, int SW, int SH, arena_t *ar) {
+    const int srb = SW / 2, orb = SH / 2, OH = SW;
     uint8_t *srow = aalloc(ar, srb);
-    int K = 0;
+    int K;
     uint8_t *slice = NULL;
-    for (K = 240; K >= 8; K /= 2) {
+    for (K = OH; K >= 8; K /= 2) {
         size_t mark = ar->used;
-        slice = aalloc(ar, (size_t)K * EPD_ROW_BYTES);
+        slice = aalloc(ar, (size_t)K * orb);
         if (slice) break;
         ar->used = mark;
     }
     if (!srow || !slice) return CV_ERR_TOOBIG;
     UINT br, bw;
-    for (int Y0 = 0; Y0 < EPD_H; Y0 += K) {
-        int n = EPD_H - Y0 < K ? EPD_H - Y0 : K;
+    for (int Y0 = 0; Y0 < OH; Y0 += K) {
+        int n = OH - Y0 < K ? OH - Y0 : K;
         f_lseek(tmp, 0);
         for (int sy = 0; sy < SH; sy++) {
             if (f_read(tmp, srow, srb, &br) != FR_OK || br != (UINT)srb) return CV_ERR_CORRUPT;
             int X = rot == 90 ? SH - 1 - sy : sy;
-            for (int j = 0; j < n; j++) {
-                int Y = Y0 + j;
+            for (int jj = 0; jj < n; jj++) {
+                int Y = Y0 + jj;
                 int sx = rot == 90 ? Y : SW - 1 - Y;
-                put_nib(slice + (size_t)j * EPD_ROW_BYTES, X, get_nib(srow, sx));
+                put_nib(slice + (size_t)jj * orb, X, get_nib(srow, sx));
             }
             if ((sy & 63) == 0) keepalive();
         }
-        if (f_write(dst, slice, (UINT)n * EPD_ROW_BYTES, &bw) != FR_OK || bw != (UINT)n * EPD_ROW_BYTES)
-            return CV_ERR_WRITE;
+        if (f_write(dst, slice, (UINT)n * orb, &bw) != FR_OK || bw != (UINT)n * orb) return CV_ERR_WRITE;
     }
     return CV_OK;
 }
 
 // ------------------------------------------------------------------ entry point
 
-cv_result_t convert_image(const char *src_path, const char *dst_path, const char *tmp_path,
-                          const convert_opts_t *o, uint8_t *arena_mem, size_t arena_size) {
-    static FIL fsrc, fdst, ftmp;
+cv_result_t convert_image(const char *src_path, const cv_output_t *outs, int nout, const char *tmp_base,
+                          const convert_opts_t *o, uint8_t *arena_mem, size_t arena_size, uint8_t *portrait) {
+    static FIL fsrc, fdst[MAX_OUT], ftmp[MAX_OUT];
+    static char tmp[MAX_OUT][300];
+    if (nout < 1 || nout > MAX_OUT) return CV_ERR_UNSUPPORTED;
     arena_t ar = {arena_mem, arena_size, 0};
-    pipe_t *p = aalloc(&ar, sizeof(pipe_t));
-    p->bg = o->background;
+    job_t *j = aalloc(&ar, sizeof(job_t));
+    j->outs = outs; j->nout = nout; j->o = o; j->m.n = nout;
+    if (portrait) *portrait = 0;
 
     if (f_open(&fsrc, src_path, FA_READ) != FR_OK) return CV_ERR_OPEN;
     uint8_t m[12] = {0};
     UINT br;
     f_read(&fsrc, m, 12, &br);
-    enum { T_JPG, T_BMP } type;
+    enum { T_JPG, T_BMP } type = T_JPG;
     cv_result_t r = CV_OK;
     if (m[0] == 0xFF && m[1] == 0xD8) type = T_JPG;
     else if (m[0] == 'B' && m[1] == 'M') type = T_BMP;
@@ -461,32 +532,63 @@ cv_result_t convert_image(const char *src_path, const char *dst_path, const char
     else r = CV_ERR_UNKNOWN;
     if (r) { f_close(&fsrc); return r; }
 
-    // Peek at the rotation first so we know where Stage A writes.
-    int rot;
-    if (type == T_JPG) { rot = (jpeg_exif_rotation(&fsrc) + o->rotate) % 360; }
-    else rot = o->rotate % 360;
-    bool turned = rot == 90 || rot == 270;
-
-    if (f_open(&fdst, dst_path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) { f_close(&fsrc); return CV_ERR_WRITE; }
-    if (turned && f_open(&ftmp, tmp_path, FA_CREATE_ALWAYS | FA_WRITE | FA_READ) != FR_OK) {
-        f_close(&fsrc); f_close(&fdst); return CV_ERR_WRITE;
+    // Size + EXIF rotation first: decides the orientation of every output.
+    int exif = 0, W = 0, H = 0;
+    bmp_t bh = {0};
+    if (type == T_JPG) {
+        exif = jpeg_exif_rotation(&fsrc);
+        int sof = jpeg_size(&fsrc, &W, &H);
+        if (sof == 2) { f_close(&fsrc); return CV_ERR_PROGRESSIVE; }
+        if (sof != 1 || W <= 0 || H <= 0) { f_close(&fsrc); return CV_ERR_CORRUPT; }
+    } else {
+        r = bmp_header(&fsrc, &bh);
+        if (r) { f_close(&fsrc); return r; }
+        W = bh.W; H = bh.H;
     }
-    p->out = turned ? &ftmp : &fdst;
+    bool photo_turned = exif == 90 || exif == 270;
+    if (portrait) *portrait = photo_turned ? (W > H) : (H > W);
+    j->rot = (exif + o->rotate) % 360;
+    bool turned = j->rot == 90 || j->rot == 270;
 
-    r = type == T_JPG ? do_jpeg(&fsrc, p, &ar, o) : do_bmp(&fsrc, p, &ar, o);
-    if (!r) while (p->out_row < p->Ah) emit_pad_row(p);       // bottom border
-    if (!r && p->err) r = p->err;
+    for (int k = 0; k < nout; k++) {
+        pipe_t *p = aalloc(&ar, sizeof(pipe_t));
+        j->m.p[k] = p;
+        p->bg = o->background;
+        p->rot = j->rot;
+        p->Aw = turned ? outs[k].h : outs[k].w;
+        p->Ah = turned ? outs[k].w : outs[k].h;
+        if (f_open(&fdst[k], outs[k].path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) r = CV_ERR_WRITE;
+        if (!r && turned) {
+            snprintf(tmp[k], sizeof tmp[k], "%s%d.bin", tmp_base, k);
+            if (f_open(&ftmp[k], tmp[k], FA_CREATE_ALWAYS | FA_WRITE | FA_READ) != FR_OK) r = CV_ERR_WRITE;
+        }
+        p->out = turned ? &ftmp[k] : &fdst[k];
+        if (r) { for (int q = 0; q <= k; q++) { f_close(&fdst[q]); if (turned) f_close(&ftmp[q]); } f_close(&fsrc); return r; }
+    }
+
+    r = type == T_JPG ? do_jpeg(&fsrc, j, &ar) : do_bmp(&fsrc, &bh, j, &ar);
+    for (int k = 0; k < nout && !r; k++) {
+        pipe_t *p = j->m.p[k];
+        while (p->out_row < p->Ah) emit_pad_row(p);       // bottom border
+        if (p->err) r = p->err;
+    }
     f_close(&fsrc);
-    if (!r && turned) {
-        arena_t ar2 = {arena_mem, arena_size, 0};               // stage A buffers are free now
-        r = transpose(&ftmp, &fdst, rot, &ar2);
+    // Copy what we still need: the transposes below reuse the arena, which holds j and the pipes.
+    int SW[MAX_OUT], SH[MAX_OUT], rot = j->rot;
+    for (int k = 0; k < nout; k++) { SW[k] = j->m.p[k]->Aw; SH[k] = j->m.p[k]->Ah; }
+    j = NULL;
+    for (int k = 0; k < nout; k++) {
+        if (!r && turned) {
+            arena_t ar2 = {arena_mem, arena_size, 0};       // stage A buffers are free now
+            r = transpose(&ftmp[k], &fdst[k], rot, SW[k], SH[k], &ar2);
+        }
+        if (turned) { f_close(&ftmp[k]); f_unlink(tmp[k]); }
+        if (f_close(&fdst[k]) != FR_OK && !r) r = CV_ERR_WRITE;
     }
-    if (turned) { f_close(&ftmp); f_unlink(tmp_path); }
-    if (f_close(&fdst) != FR_OK && !r) r = CV_ERR_WRITE;
-    if (!r) {
+    for (int k = 0; k < nout; k++) {
         FILINFO fi;
-        if (f_stat(dst_path, &fi) != FR_OK || fi.fsize != EPD_FRAME_BYTES) r = CV_ERR_WRITE;
+        if (!r && (f_stat(outs[k].path, &fi) != FR_OK || fi.fsize != (FSIZE_t)outs[k].w * outs[k].h / 2)) r = CV_ERR_WRITE;
     }
-    if (r) f_unlink(dst_path);
+    if (r) for (int k = 0; k < nout; k++) f_unlink(outs[k].path);
     return r;
 }
